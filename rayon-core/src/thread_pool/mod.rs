@@ -3,19 +3,28 @@
 //!
 //! [`ThreadPool`]: struct.ThreadPool.html
 
-#[allow(deprecated)]
-use Configuration;
-use {ThreadPoolBuilder, ThreadPoolBuildError};
+use self::unpark_mutex::UnparkMutex;
+use futures::executor::LocalPool;
+use futures::Future;
 use join;
-use {scope, Scope};
+use registry::{Registry, WorkerThread};
 use spawn;
-use std::sync::Arc;
 use std::error::Error;
 use std::fmt;
-use registry::{Registry, WorkerThread};
+use std::future::FutureObj;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::Spawn;
+use std::task::SpawnObjError;
+use std::task::{Poll, Wake};
+#[allow(deprecated)]
+use Configuration;
+use {scope, Scope};
+use {ThreadPoolBuildError, ThreadPoolBuilder};
 
 mod internal;
 mod test;
+mod unpark_mutex;
 
 /// Represents a user created [thread-pool].
 ///
@@ -58,6 +67,11 @@ pub fn build(builder: ThreadPoolBuilder) -> Result<ThreadPool, ThreadPoolBuildEr
 }
 
 impl ThreadPool {
+    ///
+    pub unsafe fn registry(&self) -> Arc<Registry> {
+        self.registry.clone()
+    }
+
     #[deprecated(note = "Use `ThreadPoolBuilder::build`")]
     #[allow(deprecated)]
     /// Deprecated in favor of `ThreadPoolBuilder::build`.
@@ -78,8 +92,9 @@ impl ThreadPool {
     #[cfg(rayon_unstable)]
     pub fn global() -> &'static Arc<ThreadPool> {
         lazy_static! {
-            static ref DEFAULT_THREAD_POOL: Arc<ThreadPool> =
-                Arc::new(ThreadPool { registry: Registry::global() });
+            static ref DEFAULT_THREAD_POOL: Arc<ThreadPool> = Arc::new(ThreadPool {
+                registry: Registry::global()
+            });
         }
 
         &DEFAULT_THREAD_POOL
@@ -118,8 +133,9 @@ impl ThreadPool {
     ///     }
     /// ```
     pub fn install<OP, R>(&self, op: OP) -> R
-        where OP: FnOnce() -> R + Send,
-              R: Send
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
     {
         self.registry.in_worker(|_, _| op())
     }
@@ -213,10 +229,11 @@ impl ThreadPool {
     /// the results. Equivalent to `self.install(|| join(oper_a,
     /// oper_b))`.
     pub fn join<A, B, RA, RB>(&self, oper_a: A, oper_b: B) -> (RA, RB)
-        where A: FnOnce() -> RA + Send,
-              B: FnOnce() -> RB + Send,
-              RA: Send,
-              RB: Send
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
     {
         self.install(|| join(oper_a, oper_b))
     }
@@ -228,7 +245,9 @@ impl ThreadPool {
     ///
     /// [scope]: fn.scope.html
     pub fn scope<'scope, OP, R>(&self, op: OP) -> R
-        where OP: for<'s> FnOnce(&'s Scope<'scope>) -> R + 'scope + Send, R: Send
+    where
+        OP: for<'s> FnOnce(&'s Scope<'scope>) -> R + 'scope + Send,
+        R: Send,
     {
         self.install(|| scope(op))
     }
@@ -242,16 +261,34 @@ impl ThreadPool {
     ///
     /// [spawn]: struct.Scope.html#method.spawn
     pub fn spawn<OP>(&self, op: OP)
-        where OP: FnOnce() + Send + 'static
+    where
+        OP: FnOnce() + Send + 'static,
     {
         // We assert that `self.registry` has not terminated.
         unsafe { spawn::spawn_in(op, &self.registry) }
+    }
+
+    ///
+    pub fn block_on<F: Future>(&self, f: F) -> F::Output {
+        let mut pool = LocalPool::new();
+        pool.run_until(f, &mut self.clone())
+    }
+}
+
+impl Clone for ThreadPool {
+    fn clone(&self) -> ThreadPool {
+        self.registry.cnt.fetch_add(1, Ordering::Relaxed);
+        ThreadPool {
+            registry: self.registry.clone(),
+        }
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        self.registry.terminate();
+        if self.registry.cnt.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.registry.terminate();
+        }
     }
 }
 
@@ -261,6 +298,92 @@ impl fmt::Debug for ThreadPool {
             .field("num_threads", &self.current_num_threads())
             .field("id", &self.registry.id())
             .finish()
+    }
+}
+
+impl Spawn for ThreadPool {
+    fn spawn_obj(&mut self, future: FutureObj<'static, ()>) -> Result<(), SpawnObjError> {
+        let task = Task {
+            future,
+            wake_handle: Arc::new(WakeHandle {
+                exec: self.clone(),
+                mutex: UnparkMutex::new(),
+            }),
+            exec: self.clone(),
+        };
+        self.spawn(move || {
+            task.run();
+        });
+        Ok(())
+    }
+}
+
+struct Task {
+    future: FutureObj<'static, ()>,
+    exec: ThreadPool,
+    wake_handle: Arc<WakeHandle>,
+}
+
+struct WakeHandle {
+    mutex: UnparkMutex<Task>,
+    exec: ThreadPool,
+}
+
+impl Task {
+    /// Actually run the task (invoking `poll` on the future) on the current
+    /// thread.
+    pub fn run(self) {
+        use futures::FutureExt;
+        use std::task;
+
+        let Task {
+            mut future,
+            wake_handle,
+            mut exec,
+        } = self;
+
+        let local_waker = task::local_waker_from_nonlocal(wake_handle.clone());
+
+        // Safety: The ownership of this `Task` object is evidence that
+        // we are in the `POLLING`/`REPOLL` state for the mutex.
+        unsafe {
+            wake_handle.mutex.start_poll();
+
+            loop {
+                let res = {
+                    let mut cx = task::Context::new(&local_waker, &mut exec);
+                    future.poll_unpin(&mut cx)
+                };
+                match res {
+                    Poll::Pending => {}
+                    Poll::Ready(()) => return wake_handle.mutex.complete(),
+                }
+                let task = Task {
+                    future,
+                    wake_handle: wake_handle.clone(),
+                    exec,
+                };
+                match wake_handle.mutex.wait(task) {
+                    Ok(()) => return, // we've waited
+                    Err(task) => {
+                        // someone's notified us
+                        future = task.future;
+                        exec = task.exec;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Wake for WakeHandle {
+    fn wake(arc_self: &Arc<Self>) {
+        match arc_self.mutex.notify() {
+            Ok(task) => arc_self.exec.spawn(move || {
+                task.run();
+            }),
+            Err(()) => {}
+        }
     }
 }
 
