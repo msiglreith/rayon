@@ -5,17 +5,16 @@
 
 use self::unpark_mutex::UnparkMutex;
 use futures::executor::LocalPool;
+use futures::future::FutureObj;
+use futures::task::{Spawn, SpawnError};
 use futures::Future;
 use join;
 use registry::{Registry, WorkerThread};
 use spawn;
 use std::error::Error;
 use std::fmt;
-use std::future::FutureObj;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::task::Spawn;
-use std::task::SpawnObjError;
 use std::task::{Poll, Wake};
 #[allow(deprecated)]
 use Configuration;
@@ -271,7 +270,7 @@ impl ThreadPool {
     ///
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
         let mut pool = LocalPool::new();
-        pool.run_until(f, &mut self.clone())
+        pool.run_until(f)
     }
 }
 
@@ -302,7 +301,7 @@ impl fmt::Debug for ThreadPool {
 }
 
 impl Spawn for ThreadPool {
-    fn spawn_obj(&mut self, future: FutureObj<'static, ()>) -> Result<(), SpawnObjError> {
+    fn spawn_obj(&mut self, future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
         let task = Task {
             future,
             wake_handle: Arc::new(WakeHandle {
@@ -334,7 +333,6 @@ impl Task {
     /// thread.
     pub fn run(self) {
         use futures::FutureExt;
-        use std::task;
 
         let Task {
             mut future,
@@ -342,7 +340,7 @@ impl Task {
             mut exec,
         } = self;
 
-        let local_waker = task::local_waker_from_nonlocal(wake_handle.clone());
+        let local_waker = futures::task::local_waker_ref_from_nonlocal(&wake_handle);
 
         // Safety: The ownership of this `Task` object is evidence that
         // we are in the `POLLING`/`REPOLL` state for the mutex.
@@ -350,10 +348,7 @@ impl Task {
             wake_handle.mutex.start_poll();
 
             loop {
-                let res = {
-                    let mut cx = task::Context::new(&local_waker, &mut exec);
-                    future.poll_unpin(&mut cx)
-                };
+                let res = future.poll_unpin(&local_waker);
                 match res {
                     Poll::Pending => {}
                     Poll::Ready(()) => return wake_handle.mutex.complete(),
